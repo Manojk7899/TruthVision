@@ -13,7 +13,10 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
-use std::{env, io::Read};
+use std::{
+    env,
+    io::{IsTerminal, Read},
+};
 
 // ---------- 1. Data model ----------
 
@@ -81,34 +84,68 @@ fn parse_model_output(raw: &str) -> Result<Detection> {
 
 // ---------- 3. Build the prompt ----------
 
-const SYSTEM_PROMPT: &str = "You are an assistant inside an AI-generated-video detection tool. \
-You do NOT see the video. You only receive the output of a separate ML classifier and, \
-optionally, keywords describing artifacts it flagged. Explain the result in clear, simple language \
-for a non-technical user. Never invent evidence that was not given to you. Be honest about \
-uncertainty: if confidence is low or probabilities are close, say the result is not conclusive. \
-Do not claim certainty; detectors can be wrong. Keep the answer under 150 words.";
+const SYSTEM_PROMPT: &str = "You write the explanation shown to everyday users of an AI-video detection app, in the style of a short, professional report. \
+The readers know nothing about AI or video technology. Write clearly and politely, as if explaining to an intelligent adult with no technical background.
+
+You do NOT see the video. You only receive the result of a separate detector and, sometimes, a list of warning signs it flagged. \
+Never say you watched the video and never add details you were not given. \
+Never say a video IS fake or real for certain. Use words like 'likely' or 'probably'.
+
+Style rules:
+- Plain everyday words only. No jargon such as artifacts, synthesized, algorithm, model or deepfake. If you must mention a technical idea, explain it in simple words.
+- Short sentences. Professional, calm and neutral tone. Do not alarm the reader or accuse whoever shared the video.
+- For each warning sign: explain what it means in simple words and give a comparison from real life (for example a badly dubbed movie).
+- Be honest about uncertainty. If the two chances are within 20 points of each other, clearly say the result is unclear and do not push a conclusion.
+- Do not give advice, tips or instructions about what the reader should do.
+- Highlighting: use **double asterisks** for bold, but ONLY for: the four section headings, the verdict (for example **probably AI-made**), the percentage (for example **93%**), and the name of each warning sign at the start of its bullet. Use no other formatting: no # symbols, no italics, no tables.
+
+Structure: write exactly these four sections in this order. Put each heading on its own line, then its content, with a blank line between sections.
+
+**Overview**
+One short paragraph of 2 to 3 sentences: what the detector concluded and how sure it is, using the detector's confidence percentage.
+
+**What the detector found**
+One short paragraph introducing the findings. Then, if warning signs were given, one bullet per sign, each starting with '- ' in the form '- **Sign name:** explanation with a real-life comparison'. If no warning signs were given, write instead a paragraph explaining what the two percentages mean, and do not claim any specific problems were seen.
+
+**What this means**
+One paragraph explaining in plain words how to read this result: how strong it is and how much uncertainty remains. If the verdict is REAL but warning signs were flagged, explain that these can be false alarms, for example from low video quality or heavy compression.
+
+**Conclusion**
+Two to three sentences summing up the overall finding in plain words, using 'likely' or 'probably', and making clear this is an estimate and not proof.
+
+Write about 200 to 260 words in total.";
 
 fn build_prompt(d: &Detection) -> String {
-    let label = match d.label {
-        Label::Fake => "FAKE (AI-generated / manipulated)",
-        Label::Real => "REAL (authentic)",
+    let verdict = match d.label {
+        Label::Fake => "FAKE (likely AI-generated or edited)",
+        Label::Real => "REAL (likely a genuine camera recording)",
     };
 
     let mut p = format!(
-        "Classifier output:\n- Prediction: {label}\n- Confidence: {:.2}\n- Probability fake: {:.1}%\n- Probability real: {:.1}%\n",
-        d.confidence,
+        "Detector result:\n- Verdict: {verdict}\n- Chance the video is fake: {:.0}%\n- Chance the video is real: {:.0}%\n",
         d.prob_fake * 100.0,
         d.prob_real * 100.0
     );
 
+    // Confidence is only shown when it is a proper 0-1 value.
+    if (0.0..=1.0).contains(&d.confidence) {
+        p.push_str(&format!(
+            "- Detector confidence in its verdict: {:.0}%\n",
+            d.confidence * 100.0
+        ));
+    }
+
     if d.keywords.is_empty() {
-        p.push_str("\nNo specific artifact keywords were provided. Explain what the verdict and confidence mean, and what kinds of signs usually lead detectors to such a verdict, without claiming any were observed.\n");
+        p.push_str("\nNo specific warning signs were given. Explain what this result means for an ordinary person. Do not claim any specific problems were seen.\n");
     } else {
         p.push_str(&format!(
-            "\nFlagged artifact keywords: {}\n\nExplain how each keyword relates to the verdict ({}), and why it is a typical sign of AI-generated video (or, if the verdict is REAL, why it may be a false alarm).\n",
-            d.keywords.join(", "),
-            if d.label == Label::Fake { "FAKE" } else { "REAL" }
+            "\nWarning signs the detector flagged: {}\n\nFor each one, explain in simple words what it means and give a real-life comparison. Say the detector flagged it, since you cannot check the video yourself.",
+            d.keywords.join(", ")
         ));
+        if d.label == Label::Real {
+            p.push_str(" The verdict is REAL, so also explain that these flags can be false alarms, for example from low video quality or heavy compression.");
+        }
+        p.push('\n');
     }
     p
 }
@@ -141,7 +178,7 @@ async fn explain_once(d: &Detection, api_key: &str, model: &str) -> Result<Strin
     let body = json!({
         "systemInstruction": { "parts": [{ "text": SYSTEM_PROMPT }] },
         "contents": [{ "role": "user", "parts": [{ "text": build_prompt(d) }] }],
-        "generationConfig": { "temperature": 0.4, "maxOutputTokens": 1024 }
+        "generationConfig": { "temperature": 0.4, "maxOutputTokens": 2048 }
     });
 
     let resp = reqwest::Client::new()
@@ -258,6 +295,24 @@ fn offline_explanation(d: &Detection) -> String {
     out
 }
 
+// ---------- 4c. Display helper ----------
+
+/// Turns **bold** markers into real bold text for the terminal.
+/// (When output is piped to another program, the ** markers are kept
+/// so the frontend can render them as bold.)
+fn bold_for_terminal(s: &str) -> String {
+    s.split("**")
+        .enumerate()
+        .map(|(i, part)| {
+            if i % 2 == 1 {
+                format!("\x1b[1m{part}\x1b[0m")
+            } else {
+                part.to_string()
+            }
+        })
+        .collect()
+}
+
 // ---------- 5. CLI entry point ----------
 
 #[tokio::main]
@@ -300,6 +355,11 @@ async fn main() -> Result<()> {
             eprintln!("Gemini unavailable, using offline summary. Reason: {e}");
             offline_explanation(&detection)
         }
+    };
+    let text = if std::io::stdout().is_terminal() {
+        bold_for_terminal(&text)
+    } else {
+        text
     };
     println!("{text}");
     Ok(())
