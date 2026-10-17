@@ -97,7 +97,9 @@ Style rules:
 - For each warning sign: explain what it means in simple words and give a comparison from real life (for example a badly dubbed movie).
 - Be honest about uncertainty. If the two chances are within 20 points of each other, clearly say the result is unclear and do not push a conclusion.
 - Do not give advice, tips or instructions about what the reader should do.
-- Highlighting: use **double asterisks** for bold, but ONLY for: the four section headings, the verdict (for example **probably AI-made**), the percentage (for example **93%**), and the name of each warning sign at the start of its bullet. Use no other formatting: no # symbols, no italics, no tables.
+- If the verdict is UNCLEAR: say in the Overview that the detector could not reach a clear answer and that the video could be either real or fake. Never call the video real or fake in this case. Explain in the second section that the chances were close, and end the Conclusion by saying no firm answer can be given.
+- If the verdict is REAL: say clearly in the Overview that the video is likely a genuine, real recording. In the second section, explain that the detector did not find strong signs of AI creation or editing, without naming specific features you were not given. Keep the same calm, professional tone, and do not sound suspicious or disappointed.
+- Highlighting: use **double asterisks** for bold, but ONLY for: the four section headings, the verdict (for example **probably AI-made** or **likely a real recording**), the percentage (for example **93%**), and the name of each warning sign at the start of its bullet. Use no other formatting: no # symbols, no italics, no tables.
 
 Structure: write exactly these four sections in this order. Put each heading on its own line, then its content, with a blank line between sections.
 
@@ -116,9 +118,20 @@ Two to three sentences summing up the overall finding in plain words, using 'lik
 Write about 200 to 260 words in total.";
 
 fn build_prompt(d: &Detection) -> String {
-    let verdict = match d.label {
-        Label::Fake => "FAKE (likely AI-generated or edited)",
-        Label::Real => "REAL (likely a genuine camera recording)",
+    // If the two chances are close, the result is unclear. Decide this in code
+    // so Gemini cannot talk itself into a firm verdict.
+    let unclear = (d.prob_fake - d.prob_real).abs() < 0.2;
+
+    let verdict = if unclear {
+        match d.label {
+            Label::Fake => "UNCLEAR (too close to call, leaning very slightly towards fake)",
+            Label::Real => "UNCLEAR (too close to call, leaning very slightly towards real)",
+        }
+    } else {
+        match d.label {
+            Label::Fake => "FAKE (likely AI-generated or edited)",
+            Label::Real => "REAL (likely a genuine camera recording)",
+        }
     };
 
     let mut p = format!(
@@ -135,14 +148,24 @@ fn build_prompt(d: &Detection) -> String {
         ));
     }
 
+    if unclear {
+        p.push_str("\nIMPORTANT: the two chances are close, so the result is UNCLEAR. Do NOT say the video is real and do NOT say it is fake. Say clearly that the detector could not reach a clear answer, and that the video could be either. In the Conclusion, state that no firm answer can be given.\n");
+    }
+
     if d.keywords.is_empty() {
-        p.push_str("\nNo specific warning signs were given. Explain what this result means for an ordinary person. Do not claim any specific problems were seen.\n");
+        if unclear {
+            // nothing more to add
+        } else if d.label == Label::Real {
+            p.push_str("\nThe verdict is REAL. Clearly tell the reader that this video is likely genuine, and explain that the detector found no strong signs of AI creation or editing. Do not invent specific reasons or features.\n");
+        } else {
+            p.push_str("\nNo specific warning signs were given. Explain what this result means for an ordinary person. Do not claim any specific problems were seen.\n");
+        }
     } else {
         p.push_str(&format!(
             "\nWarning signs the detector flagged: {}\n\nFor each one, explain in simple words what it means and give a real-life comparison. Say the detector flagged it, since you cannot check the video yourself.",
             d.keywords.join(", ")
         ));
-        if d.label == Label::Real {
+        if d.label == Label::Real && !unclear {
             p.push_str(" The verdict is REAL, so also explain that these flags can be false alarms, for example from low video quality or heavy compression.");
         }
         p.push('\n');
@@ -247,51 +270,107 @@ async fn explain_with_fallback(d: &Detection, api_key: &str, models: &[String]) 
 fn keyword_hint(keyword: &str) -> &'static str {
     let k = keyword.to_lowercase();
     if k.contains("lip") || k.contains("sync") {
-        "mouth movements that don't match the audio are a common artifact of generated or manipulated video"
+        "The movement of the mouth does not line up well with the words being spoken, a bit like a badly dubbed movie."
     } else if k.contains("blink") || k.contains("eye") {
-        "unnatural or missing blinking and odd eye movement are often seen in synthetic faces"
+        "The eyes blink too little, too much, or in an unnatural way, like a character that does not quite move like a real person."
     } else if k.contains("blur") || k.contains("edge") {
-        "soft or smeared edges, especially around the face or hair, can appear where a fake face is blended in"
+        "The outline around the person looks soft or smudged, like a cut-out picture pasted onto a background."
     } else if k.contains("light") || k.contains("shadow") {
-        "lighting or shadows that don't match the scene can suggest parts of the frame were generated"
+        "The lighting or shadows on the person do not match the rest of the scene, like a sticker placed on top of a photo."
     } else if k.contains("skin") || k.contains("texture") {
-        "overly smooth or inconsistent skin texture is a frequent sign of AI-generated faces"
+        "The skin looks unusually smooth or uneven, like a heavily airbrushed photo."
     } else {
-        "detectors often associate this kind of artifact with manipulated video"
+        "The detector noticed something unusual here that it often sees in edited or computer-made videos."
     }
 }
 
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Same four-section layout as the Gemini answer, built without any API call.
 fn offline_explanation(d: &Detection) -> String {
-    let (verdict, p) = match d.label {
-        Label::Fake => ("FAKE (likely AI-generated or manipulated)", d.prob_fake),
-        Label::Real => ("REAL (likely authentic)", d.prob_real),
+    let (verdict_text, p) = match d.label {
+        Label::Fake => ("probably AI-made or edited", d.prob_fake),
+        Label::Real => ("probably a genuine camera recording", d.prob_real),
     };
+    let pct = p * 100.0;
+    let unclear = (d.prob_fake - d.prob_real).abs() < 0.2;
 
-    let gap = (d.prob_fake - d.prob_real).abs();
-    let strength = if gap < 0.2 {
-        "The result is not conclusive because the two probabilities are close."
-    } else if p >= 0.9 {
-        "The detector is very confident in this result."
+    let mut out = String::new();
+
+    // 1. Overview
+    out.push_str("**Overview**\n");
+    if unclear {
+        out.push_str(&format!(
+            "The detector could not reach a clear answer for this video. The chances are close: about **{:.0}%** fake and **{:.0}%** real.\n\n",
+            d.prob_fake * 100.0,
+            d.prob_real * 100.0
+        ));
     } else {
-        "The detector is fairly confident, but not certain."
-    };
-
-    let mut out = format!(
-        "[Offline summary - AI explanation unavailable]\nThe detector predicts {verdict} with {:.1}% probability. {strength}",
-        p * 100.0
-    );
-
-    if !d.keywords.is_empty() {
-        out.push_str("\n\nFlagged signs:");
-        for k in &d.keywords {
-            out.push_str(&format!("\n- {k}: {}", keyword_hint(k)));
-        }
-        if d.label == Label::Real {
-            out.push_str("\n\nSince the verdict is REAL, these flags may be false alarms (for example caused by compression or low video quality).");
-        }
+        out.push_str(&format!(
+            "The detector checked this video and concluded that it is **{verdict_text}**. It is about **{pct:.0}%** sure of this result.\n\n"
+        ));
     }
 
-    out.push_str("\n\nNote: detectors can be wrong, so treat this as a guide and not proof.");
+    // 2. What the detector found
+    out.push_str("**What the detector found**\n");
+    if d.keywords.is_empty() {
+        if d.label == Label::Real {
+            out.push_str(&format!(
+                "The detector did not find strong signs that this video was made or edited by AI. It gave a **{:.0}%** chance that the video is real and a **{:.0}%** chance that it is fake.\n\n",
+                d.prob_real * 100.0,
+                d.prob_fake * 100.0
+            ));
+        } else {
+            out.push_str(&format!(
+                "The detector gave two percentages: a **{:.0}%** chance that the video is fake and a **{:.0}%** chance that it is real. It did not point out any specific problems in the video.\n\n",
+                d.prob_fake * 100.0,
+                d.prob_real * 100.0
+            ));
+        }
+    } else {
+        out.push_str("The detector flagged the following warning signs in this video:\n");
+        for k in &d.keywords {
+            out.push_str(&format!("- **{}:** {}\n", capitalize(k), keyword_hint(k)));
+        }
+        out.push('\n');
+    }
+
+    // 3. What this means
+    out.push_str("**What this means**\n");
+    let meaning = if unclear {
+        "Because the two chances are so close, this result is unclear. The detector cannot say with any confidence whether the video is real or fake."
+    } else if d.label == Label::Real {
+        if p >= 0.9 {
+            "The detector is very sure that this looks like genuine camera footage. It did not find strong signs of AI creation or editing."
+        } else {
+            "The detector leans towards this being genuine camera footage, but it is not completely certain. Some doubt remains."
+        }
+    } else if p >= 0.9 {
+        "The detector is very sure about this result, which means the patterns it looks for were strong."
+    } else {
+        "The detector leans towards this result, but it is not completely certain. Some doubt remains."
+    };
+    out.push_str(meaning);
+    if d.label == Label::Real && !d.keywords.is_empty() {
+        out.push_str(" Some warning signs were flagged even though the verdict is real. These can be false alarms, for example when a video is low quality or has been heavily compressed.");
+    }
+    out.push_str("\n\n");
+
+    // 4. Conclusion
+    out.push_str("**Conclusion**\n");
+    if unclear {
+        out.push_str("Overall, the result is unclear. It is an estimate and should not be treated as proof either way.");
+    } else {
+        out.push_str(&format!(
+            "Overall, this video is {verdict_text}. This is an estimate based on the detector's analysis, and not proof."
+        ));
+    }
     out
 }
 
@@ -374,6 +453,25 @@ mod tests {
         let d = parse_model_output("Prediction: FAKE\nConfidence: 0.93\nProbability: [0.93, 0.07]").unwrap();
         assert_eq!(d.label, Label::Fake);
         assert!((d.prob_real - 0.07).abs() < 1e-9);
+    }
+
+    #[test]
+    fn offline_has_all_sections() {
+        let mut d = parse_model_output("Prediction: FAKE\nConfidence: 0.93\nProbability: [0.93, 0.07]").unwrap();
+        d.keywords = vec!["lip sync missing".into()];
+        let t = offline_explanation(&d);
+        for h in ["**Overview**", "**What the detector found**", "**What this means**", "**Conclusion**"] {
+            assert!(t.contains(h), "missing {h}");
+        }
+        assert!(t.contains("Lip sync missing"));
+    }
+
+    #[test]
+    fn offline_real_says_genuine() {
+        let d = parse_model_output("Prediction: REAL\nConfidence: 0.95\nProbability: [0.05, 0.95]").unwrap();
+        let t = offline_explanation(&d);
+        assert!(t.contains("genuine camera recording"));
+        assert!(t.contains("did not find strong signs"));
     }
 
     #[test]
